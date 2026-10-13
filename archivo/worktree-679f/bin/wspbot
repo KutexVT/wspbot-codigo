@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# Arranca el bridge solo o con un contexto explicito de Contacto o de un amigo
+
+set -uo pipefail
+
+BASE="${WSP_BASE:-/home/kutex/WSP Bot}"
+BRIDGE_DIR="${WSP_BRIDGE_DIR:-$BASE/whatsapp-mcp/whatsapp-bridge}"
+EVENTO="${WSP_EVENTO:-$BASE/bin/evento-wsp.py}"
+RESOLVER="${WSP_PERSONA_RESOLVER:-$BASE/bin/persona-wsp}"
+INDICE="${WSP_PERSONAS_INDEX:-$BASE/memoria/amigos/personas.tsv}"
+SALUD_URL="${WSP_SALUD_URL:-http://127.0.0.1:8080/api/health}"
+AGENT_FILE="${WSP_AGENT_FILE:-$BASE/nucleo/eventos/agente}"
+
+rojo()  { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+verde() { printf '\033[32m%s\033[0m\n' "$*"; }
+gris()  { printf '\033[2m%s\033[0m\n' "$*"; }
+
+uso() {
+  cat <<'FIN'
+wspbot — arranca el bot de WhatsApp
+
+  wspbot                              arranca solo el bridge sin IA
+  wspbot --codex                     flujo actual de Contacto con Codex
+  wspbot --claude                    flujo actual de Contacto con Claude
+  wspbot --chat <jid> --codex        contexto aislado de un amigo
+  wspbot --chat <jid> --claude       contexto aislado de un amigo
+  wspbot --stop-ia                   apaga un watcher de IA inactivo
+  wspbot --status                    dice como está sin arrancar nada
+FIN
+}
+
+ACCION="arrancar"
+MOTOR=""
+CHAT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --claude|--codex)
+      [ "$ACCION" = "arrancar" ] && [ -z "$MOTOR" ] || {
+        rojo "usa solo un modo a la vez"
+        exit 2
+      }
+      MOTOR="${1#--}"
+      shift
+      ;;
+    --chat)
+      [ -z "$CHAT" ] && [ -n "${2:-}" ] && [[ "${2:-}" != --* ]] || {
+        rojo "--chat requiere un solo JID"
+        exit 2
+      }
+      CHAT="$2"
+      shift 2
+      ;;
+    --status|-s)
+      [ "$ACCION" = "arrancar" ] && [ -z "$MOTOR" ] || {
+        rojo "--status no se combina con otro modo"
+        exit 2
+      }
+      ACCION="status"
+      shift
+      ;;
+    --stop-ia)
+      [ "$ACCION" = "arrancar" ] && [ -z "$MOTOR" ] || {
+        rojo "--stop-ia no se combina con otro modo"
+        exit 2
+      }
+      ACCION="stop-ia"
+      shift
+      ;;
+    --help|-h) uso; exit 0 ;;
+    *) rojo "no conozco la opcion: $1"; echo; uso; exit 2 ;;
+  esac
+done
+
+if [ -n "$CHAT" ]; then
+  [ "$ACCION" = "arrancar" ] && [ -n "$MOTOR" ] || {
+    rojo "--chat requiere --codex o --claude"
+    exit 2
+  }
+  [ -x "$RESOLVER" ] || { rojo "no existe el resolvedor de amigos: $RESOLVER"; exit 1; }
+  RESUELTO="$("$RESOLVER" "$INDICE" "$CHAT")" || exit $?
+  JID="$(sed -n 's/^JID=//p' <<< "$RESUELTO")"
+  SEGURO="$(sed -n 's/^SEGURO=//p' <<< "$RESUELTO")"
+  ALIAS="$(sed -n 's/^ALIAS=//p' <<< "$RESUELTO")"
+  THREAD="$(sed -n 's/^THREAD=//p' <<< "$RESUELTO")"
+  MEMORIA="$BASE/memoria/amigos/$SEGURO"
+  PERSONA_STATE="$BASE/nucleo/amigos/$SEGURO"
+
+  [ -f "$BASE/PROMPT_AMIGOS.md" ] || { rojo "falta $BASE/PROMPT_AMIGOS.md"; exit 1; }
+  [ -d "$MEMORIA" ] || { rojo "falta la memoria aislada del amigo: $MEMORIA"; exit 1; }
+
+  if [ "$MOTOR" = "codex" ]; then
+    [ -n "$THREAD" ] || { rojo "falta el hilo Codex de $ALIAS en $INDICE"; exit 1; }
+    [[ "$THREAD" =~ ^[0-9A-Za-z_-]+$ ]] || { rojo "hilo Codex invalido para $ALIAS"; exit 1; }
+    GINGER_THREAD="${WSP_GINGER_CODEX_THREAD_ID:-$(sed -n 's/^target_thread_id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${WSP_GINGER_CODEX_AUTOMATION:-/home/kutex/.codex/automations/wspbot/automation.toml}" 2>/dev/null | head -1)}"
+    [ -z "$GINGER_THREAD" ] || [ "$THREAD" != "$GINGER_THREAD" ] || {
+      rojo "el hilo Codex de $ALIAS es el hilo de Contacto"
+      exit 1
+    }
+  fi
+
+  export WSP_JID="$JID"
+  export WSP_MEMORIA="$MEMORIA"
+  export WSP_PERSONA_ALIAS="$ALIAS"
+  export WSP_PERSONAS_INDEX="$INDICE"
+  export WSP_ROL_CONTACTO="AMIGO"
+  export WSP_CODEX_PROMPT="sigue al pie de la letra $BASE/PROMPT_AMIGOS.md para el JID $JID"
+  export WSP_CURSOR="$PERSONA_STATE/cursor.txt"
+  export WSP_LOCK="$PERSONA_STATE/.lock"
+  export WSP_LOGS="$PERSONA_STATE/logs"
+  export WSP_TRASPASO="$PERSONA_STATE/.traspaso"
+  export WSP_CITAS="$PERSONA_STATE/.citas"
+  export WSP_MUDO="$PERSONA_STATE/MUDO"
+  export WSP_MARCA_VUELTA="$PERSONA_STATE/.ultima_vuelta"
+  export WSP_MARCA_VOLVI="$PERSONA_STATE/.volvi_pendiente"
+  export WSP_MARCA_AVISO="$PERSONA_STATE/.aviso_bridge"
+  export WSP_ESTRENO_STICKERS="$PERSONA_STATE/ESTRENO_STICKERS_HECHO"
+  export WSP_EVENT_STATE="$PERSONA_STATE/eventos"
+  export WSP_AGENT_FILE="$PERSONA_STATE/eventos/agente"
+  export WSP_CLAUDE_SESSION="$PERSONA_STATE/eventos/claude-session"
+  export WSP_CODEX_AUTOMATION="$PERSONA_STATE/eventos/codex-automation.toml"
+  [ "$MOTOR" != "codex" ] || export WSP_CODEX_THREAD_ID="$THREAD"
+  AGENT_FILE="$WSP_AGENT_FILE"
+fi
+
+bridge_pid() { pgrep -x whatsapp-client 2>/dev/null || true; }
+worker_pid() { pgrep -f -- "$EVENTO worker$" 2>/dev/null || true; }
+watcher_pid() { pgrep -f -- "$EVENTO watch$" 2>/dev/null || true; }
+
+if [ "$ACCION" = "status" ]; then
+  SALIDA_DOCTOR="$("$EVENTO" doctor 2>&1)"
+  MOTOR_ACTUAL="$(sed -n 's/^AGENT=//p' <<< "$SALIDA_DOCTOR")"
+  echo "$SALIDA_DOCTOR"
+  echo
+  pid="$(bridge_pid)"
+  respuesta="$(curl -sS -m 2 -w $'\n%{http_code}' "$SALUD_URL" 2>/dev/null || true)"
+  codigo="${respuesta##*$'\n'}"
+  cuerpo="${respuesta%$'\n'*}"
+  if [ "$codigo" = "200" ] && [[ "$cuerpo" == *'"connected":true'* ]] && [[ "$cuerpo" == *'"logged_in":true'* ]]; then
+    verde "bridge:  conectado (PID ${pid:-?})"
+  elif [ -n "$pid" ]; then
+    gris "bridge:  arrancando o desconectado (PID $pid)"
+  else
+    gris "bridge:  apagado"
+  fi
+  wpid="$(watcher_pid)"
+  worker="$(worker_pid)"
+  [ -n "$wpid$worker" ] && verde "ia:      activa (${MOTOR_ACTUAL:-?})" || gris "ia:      apagada"
+  exit 0
+fi
+
+if pid="$(bridge_pid)"; [ -n "$pid" ]; then
+  rojo "ya hay un bridge corriendo (PID $pid)"
+  rojo "cierralo con Ctrl+C antes de cambiar de contexto"
+  exit 1
+fi
+if pid="$(worker_pid)"; [ -n "$pid" ]; then
+  rojo "hay una vuelta de IA corriendo (PID $pid)"
+  exit 1
+fi
+
+wpid="$(watcher_pid)"
+if [ "$ACCION" = "stop-ia" ]; then
+  [ -n "$wpid" ] || { gris "IA ya estaba apagada"; exit 0; }
+  fallo=0
+  while IFS= read -r pid; do
+    [ -z "$pid" ] || kill "$pid" || fallo=1
+  done <<< "$wpid"
+  [ "$fallo" -eq 0 ] || { rojo "no pude apagar todos los watchers"; exit 1; }
+  verde "IA apagada"
+  exit 0
+fi
+[ -z "$wpid" ] || {
+  rojo "hay un watcher de IA corriendo (PID $wpid)"
+  rojo "apagalo primero con: wspbot --stop-ia"
+  exit 1
+}
+
+cd "$BRIDGE_DIR" || { rojo "no existe $BRIDGE_DIR"; exit 1; }
+
+if [ -z "$MOTOR" ]; then
+  export WSP_EVENT_TRIGGER=""
+  verde "▶ arrancando sin IA"
+else
+  if [ -n "$CHAT" ]; then
+    mkdir -p "$PERSONA_STATE/eventos" "$WSP_LOGS"
+    if [ ! -f "$WSP_CURSOR" ]; then
+      ULTIMO="$(sqlite3 "${WSP_DB:-$BRIDGE_DIR/store/messages.db}" "select coalesce(max(substr(timestamp,1,19)), '1970-01-01 00:00:00') from messages where chat_jid = '${JID//\'/\'\'}';" 2>/dev/null)" || {
+        rojo "no pude inicializar el cursor aislado de $ALIAS"
+        exit 1
+      }
+      printf 'LAST_GINGER_TS=%s\nLAST_VISTO_TS=%s\nLAST_LEIDO_TS=%s\n' "$ULTIMO" "$ULTIMO" "$ULTIMO" > "$WSP_CURSOR"
+    fi
+  else
+    mkdir -p "$(dirname "$AGENT_FILE")"
+  fi
+  printf '%s\n' "$MOTOR" > "$AGENT_FILE"
+  export WSP_AGENT="$MOTOR"
+  export WSP_EVENT_TRIGGER="${WSP_EVENT_TRIGGER:-$EVENTO}"
+
+  SALIDA_DOCTOR="$("$EVENTO" doctor 2>&1)"
+  RC_DOCTOR=$?
+  if [ "$RC_DOCTOR" -ne 0 ]; then
+    rojo "doctor fallo y no arranco nada:"
+    echo "$SALIDA_DOCTOR" >&2
+    exit 1
+  fi
+  if [ -n "$CHAT" ]; then
+    verde "▶ arrancando con $MOTOR para $ALIAS ($JID)"
+    gris "  estado: $PERSONA_STATE"
+  else
+    verde "▶ arrancando con $MOTOR"
+    gris "  contexto: Contacto"
+  fi
+  if ! "$EVENTO" bridge-starting >/dev/null; then
+    rojo "no pude abrir la gracia de arranque"
+    exit 1
+  fi
+fi
+
+gris "  deja esta terminal abierta: cerrarla apaga el bridge"
+echo
+exec ./whatsapp-client

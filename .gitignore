@@ -1,0 +1,17 @@
+.env
+.env.*
+*.db
+*.db-*
+*.sqlite*
+__pycache__/
+*.pyc
+.venv/
+venv*/
+chats/
+logs/
+media/
+memoria/
+nucleo/
+.backup*/
+whatsapp-mcp/whatsapp-bridge/store/
+whatsapp-mcp/whatsapp-bridge/whatsapp-client*

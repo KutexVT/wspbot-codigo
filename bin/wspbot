@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# wspbot — arranca el bridge de WhatsApp eligiendo quien piensa.
+#
+#   wspbot            arranca solo el bridge, sin IA
+#   wspbot --claude   arranca el bridge con Claude Code
+#   wspbot --codex    arranca el bridge con Codex
+#   wspbot --stop-ia  apaga un watcher de IA inactivo
+#   wspbot --status   dice como esta sin arrancar nada
+#
+# Existe porque el alias de antes no podia llevar flags: `wspbot --claude` le pasaba el
+# --claude al binario Go, que no lee argumentos. Y porque el motor elegido tiene que vivir
+# en disco y no en el entorno de una terminal suelta, para que `doctor` no mienta.
+
+set -uo pipefail
+
+BASE="${WSP_BASE:-/home/kutex/WSP Bot}"
+BRIDGE_DIR="${WSP_BRIDGE_DIR:-$BASE/whatsapp-mcp/whatsapp-bridge}"
+EVENTO="${WSP_EVENTO:-$BASE/bin/evento-wsp.py}"
+AGENT_FILE="${WSP_AGENT_FILE:-$BASE/nucleo/eventos/agente}"
+SALUD_URL="${WSP_SALUD_URL:-http://127.0.0.1:8080/api/health}"
+
+rojo()  { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+verde() { printf '\033[32m%s\033[0m\n' "$*"; }
+gris()  { printf '\033[2m%s\033[0m\n' "$*"; }
+
+uso() {
+  cat <<'FIN'
+wspbot — arranca el bot de WhatsApp
+
+  wspbot              arranca solo el bridge, sin IA
+  wspbot --claude     arranca el bridge con Claude Code
+  wspbot --codex      arranca el bridge con Codex (hilo de la app de ChatGPT)
+  wspbot --stop-ia    apaga el watcher de IA si no hay una vuelta activa
+  wspbot --status     dice como esta sin arrancar nada
+  wspbot --help       esto
+
+Los dos motores NO comparten contexto: cambiar de uno a otro arranca en blanco.
+FIN
+}
+
+ACCION="arrancar"
+MOTOR=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --claude|--codex)
+      [ "$ACCION" = "arrancar" ] && [ -z "$MOTOR" ] || {
+        rojo "usa solo un modo a la vez"
+        exit 2
+      }
+      MOTOR="${1#--}"
+      ;;
+    --status|-s)
+      [ "$ACCION" = "arrancar" ] && [ -z "$MOTOR" ] || {
+        rojo "--status no se combina con otro modo"
+        exit 2
+      }
+      ACCION="status"
+      ;;
+    --stop-ia)
+      [ "$ACCION" = "arrancar" ] && [ -z "$MOTOR" ] || {
+        rojo "--stop-ia no se combina con otro modo"
+        exit 2
+      }
+      ACCION="stop-ia"
+      ;;
+    --help|-h)   uso; exit 0 ;;
+    *)           rojo "no conozco la opcion: $1"; echo; uso; exit 2 ;;
+  esac
+  shift
+done
+
+bridge_pid() { pgrep -x whatsapp-client 2>/dev/null || true; }
+worker_pid() { pgrep -f -- "$EVENTO worker$" 2>/dev/null || true; }
+watcher_pid() { pgrep -f -- "$EVENTO watch$" 2>/dev/null || true; }
+
+if [ "$ACCION" = "status" ]; then
+  SALIDA_DOCTOR="$("$EVENTO" doctor 2>&1)"
+  MOTOR_ACTUAL="$(sed -n 's/^AGENT=//p' <<< "$SALIDA_DOCTOR")"
+  echo "$SALIDA_DOCTOR"
+  echo
+  pid="$(bridge_pid)"
+  respuesta="$(curl -sS -m 2 -w $'\n%{http_code}' "$SALUD_URL" 2>/dev/null || true)"
+  codigo="${respuesta##*$'\n'}"
+  cuerpo="${respuesta%$'\n'*}"
+  etiqueta_pid="${pid:-?}"
+  if [ "$codigo" = "200" ] && [[ "$cuerpo" == *'"logged_in":false'* ]]; then
+    rojo "bridge:  sesion cerrada — reescanea el QR (PID $etiqueta_pid)"
+  elif [ "$codigo" = "200" ] && [[ "$cuerpo" == *'"connected":false'* ]]; then
+    rojo "bridge:  desconectado de WhatsApp (PID $etiqueta_pid)"
+  elif [ "$codigo" = "200" ] && [[ "$cuerpo" == *'"connected":true'* ]] && [[ "$cuerpo" == *'"logged_in":true'* ]]; then
+    verde "bridge:  conectado (PID $etiqueta_pid)"
+  elif [ "$codigo" = "404" ]; then
+    verde "bridge:  vivo sin health detallado (PID $etiqueta_pid)"
+  elif [ -n "$pid" ]; then
+    gris "bridge:  arrancando — el 8080 aun no responde (PID $pid)"
+  else
+    gris  "bridge:  apagado"
+  fi
+  wpid="$(watcher_pid)"
+  worker="$(worker_pid)"
+  if [ -n "$wpid" ] || [ -n "$worker" ]; then
+    verde "ia:      activa (${MOTOR_ACTUAL:-?})"
+  else
+    gris  "ia:      apagada (ultimo motor: ${MOTOR_ACTUAL:-?})"
+  fi
+  if [ -n "$wpid" ]; then
+    verde "watcher: corriendo (PID $wpid)"
+  else
+    gris  "watcher: apagado"
+  fi
+  [ -s "$BASE/nucleo/eventos/state.json" ] && { echo; "$EVENTO" status; }
+  exit 0
+fi
+
+if pid="$(bridge_pid)"; [ -n "$pid" ]; then
+  if [ "$ACCION" = "stop-ia" ]; then
+    rojo "hay un bridge corriendo (PID $pid)"
+    rojo "cierralo con Ctrl+C antes de apagar la IA"
+    exit 1
+  fi
+  rojo "ya hay un bridge corriendo (PID $pid)"
+  rojo "matalo con Ctrl+C en su terminal antes de arrancar otro"
+  exit 1
+fi
+
+if pid="$(worker_pid)"; [ -n "$pid" ]; then
+  rojo "hay una vuelta de IA corriendo (PID $pid)"
+  rojo "espera que termine antes de cambiar de modo"
+  exit 1
+fi
+
+wpid="$(watcher_pid)"
+if [ "$ACCION" = "stop-ia" ]; then
+  if [ -z "$wpid" ]; then
+    gris "IA ya estaba apagada"
+    exit 0
+  fi
+  fallo=0
+  while IFS= read -r pid; do
+    [ -z "$pid" ] || kill "$pid" || fallo=1
+  done <<< "$wpid"
+  if [ "$fallo" -ne 0 ]; then
+    rojo "no pude apagar todos los watchers"
+    exit 1
+  fi
+  verde "IA apagada"
+  exit 0
+fi
+
+if [ -n "$wpid" ]; then
+  rojo "hay un watcher de IA corriendo (PID $wpid)"
+  rojo "apagalo primero con: wspbot --stop-ia"
+  exit 1
+fi
+
+cd "$BRIDGE_DIR" || { rojo "no existe $BRIDGE_DIR"; exit 1; }
+
+if [ -z "$MOTOR" ]; then
+  export WSP_EVENT_TRIGGER=""
+  verde "▶ arrancando sin IA"
+else
+  mkdir -p "$(dirname "$AGENT_FILE")"
+  printf '%s\n' "$MOTOR" > "$AGENT_FILE"
+  export WSP_AGENT="$MOTOR"
+  export WSP_EVENT_TRIGGER="${WSP_EVENT_TRIGGER:-$EVENTO}"
+  gris "motor guardado: $MOTOR"
+
+  SALIDA_DOCTOR="$("$EVENTO" doctor 2>&1)"
+  RC_DOCTOR=$?
+  if [ "$RC_DOCTOR" -ne 0 ]; then
+    rojo "doctor fallo, no arranco nada:"
+    echo "$SALIDA_DOCTOR" >&2
+    exit 1
+  fi
+  verde "▶ arrancando con $MOTOR"
+  gris  "  log de vueltas:  $BASE/nucleo/eventos/runner.log"
+  if ! "$EVENTO" bridge-starting >/dev/null; then
+    rojo "no pude abrir la gracia de arranque"
+    exit 1
+  fi
+fi
+
+gris "  deja esta terminal abierta: cerrarla apaga el bridge"
+echo
+# exec para que el bridge sea ESTE proceso: asi Ctrl+C lo mata directo, igual que antes.
+exec ./whatsapp-client

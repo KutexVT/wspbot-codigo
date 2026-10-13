@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Resuelve un JID o alias registrado sin adivinar ni tocar estado
+
+set -uo pipefail
+
+INDICE="${1:-}"
+CONSULTA="${2:-}"
+
+[ -n "$INDICE" ] && [ -n "$CONSULTA" ] || {
+  echo "ERROR: uso: persona-wsp <personas.tsv> <jid-o-alias>" >&2
+  exit 2
+}
+[ -f "$INDICE" ] || {
+  echo "ERROR: falta el indice privado de amigos: $INDICE" >&2
+  exit 1
+}
+
+if [[ "$CONSULTA" == *"@"* ]] && [[ ! "$CONSULTA" =~ ^[0-9]+@(lid|s\.whatsapp\.net)$ ]]; then
+  echo "ERROR: JID invalido: $CONSULTA" >&2
+  exit 1
+fi
+
+matches=()
+while IFS=$'\t' read -r alias jid thread extra; do
+  [ -n "$alias$jid$thread$extra" ] || continue
+  [[ "$alias" == \#* ]] && continue
+  [ -z "$extra" ] && [ -n "$alias" ] && [[ "$jid" =~ ^[0-9]+@(lid|s\.whatsapp\.net)$ ]] || {
+    echo "ERROR: fila invalida en $INDICE: cada fila requiere alias<TAB>jid<TAB>hilo-codex-opcional" >&2
+    exit 1
+  }
+  if [[ "$CONSULTA" == *"@"* ]]; then
+    [ "$jid" = "$CONSULTA" ] && matches+=("$alias"$'\t'"$jid"$'\t'"$thread")
+  elif [[ "${alias,,}" == "${CONSULTA,,}" ]]; then
+    matches+=("$alias"$'\t'"$jid"$'\t'"$thread")
+  fi
+done < "$INDICE"
+
+if [ ${#matches[@]} -eq 0 ]; then
+  if [[ "$CONSULTA" == *"@"* ]]; then
+    echo "ERROR: persona no registrada: $CONSULTA" >&2
+  else
+    echo "ERROR: alias inexistente: $CONSULTA" >&2
+  fi
+  exit 1
+fi
+[ ${#matches[@]} -eq 1 ] || {
+  echo "ERROR: alias ambiguo: $CONSULTA" >&2
+  exit 1
+}
+
+IFS=$'\t' read -r ALIAS JID THREAD <<< "${matches[0]}"
+SEGURO="${JID//@/_at_}"
+SEGURO="${SEGURO//./_}"
+printf 'JID=%s\nSEGURO=%s\nALIAS=%s\nTHREAD=%s\n' "$JID" "$SEGURO" "$ALIAS" "$THREAD"
